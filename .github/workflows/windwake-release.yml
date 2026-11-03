@@ -156,6 +156,7 @@ jobs:
           import hashlib, json, os, pathlib, re, shlex, subprocess, sys, zipfile
           sys.path.insert(0, 'tools/android')
           from reuse_release_compiler import inventory, METADATA
+          from verify_apk_shortcuts import verify as verify_shortcuts
           apk = pathlib.Path(os.environ['APK'])
           def sha(path):
               with path.open('rb') as stream: return hashlib.file_digest(stream, 'sha256').hexdigest()
@@ -169,9 +170,7 @@ jobs:
           expected = {'name': 'dev.windwake.android', 'versionCode': os.environ['VERSION_CODE'], 'versionName': os.environ['VERSION_NAME']}
           if any(package.get(k) != v for k, v in expected.items()): raise SystemExit('APK manifest identity/version mismatch')
           if "application-label:'Windwake'" not in badging.splitlines(): raise SystemExit('APK label mismatch')
-          shortcuts = subprocess.check_output([str(aapt), 'dump', 'xmltree', str(apk), '--file', 'res/xml/shortcuts.xml'], text=True)
-          targets = re.findall(r':targetPackage\([^)]*\)="([^"]+)"', shortcuts)
-          if targets != [package['name']] * 3: raise SystemExit('launcher shortcuts must target this APK application ID')
+          print('Verified launcher shortcuts:', verify_shortcuts(aapt, apk, package['name']))
           with zipfile.ZipFile(apk) as archive:
               files = inventory(archive)
               if any(re.fullmatch(r'lib/[^/]+/libmain\.so', n) for n in files): raise SystemExit('libmain.so is forbidden')
