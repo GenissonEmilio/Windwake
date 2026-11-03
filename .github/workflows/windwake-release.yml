@@ -169,6 +169,9 @@ jobs:
           expected = {'name': 'dev.windwake.android', 'versionCode': os.environ['VERSION_CODE'], 'versionName': os.environ['VERSION_NAME']}
           if any(package.get(k) != v for k, v in expected.items()): raise SystemExit('APK manifest identity/version mismatch')
           if "application-label:'Windwake'" not in badging.splitlines(): raise SystemExit('APK label mismatch')
+          shortcuts = subprocess.check_output([str(aapt), 'dump', 'xmltree', str(apk), '--file', 'res/xml/shortcuts.xml'], text=True)
+          targets = re.findall(r':targetPackage\([^)]*\)="([^"]+)"', shortcuts)
+          if targets != [package['name']] * 3: raise SystemExit('launcher shortcuts must target this APK application ID')
           with zipfile.ZipFile(apk) as archive:
               files = inventory(archive)
               if any(re.fullmatch(r'lib/[^/]+/libmain\.so', n) for n in files): raise SystemExit('libmain.so is forbidden')
