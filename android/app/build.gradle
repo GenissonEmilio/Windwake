@@ -10,7 +10,7 @@ android {
     buildToolsVersion "35.0.0"  // pinned (the CI installs this one)
     ndkVersion "30.0.16248370"  // android/build_native.sh's default (the native libraries come from there)
     defaultConfig {
-        applicationId "org.wwhdrecomp.wwhd"
+        applicationId providers.gradleProperty('wwhdApplicationId').getOrElse('org.wwhdrecomp.wwhd')
         buildConfigField 'boolean', 'QUEST_THEATER', providers.gradleProperty('wwhdQuestTheater').getOrElse('true')
         testInstrumentationRunner "org.wwhdrecomp.wwhd.SetupPolishInstrumentation"
         minSdk 33
@@ -69,6 +69,7 @@ android {
     def gameIcon = file('local-res').exists()
     if (gameIcon) sourceSets.main.res.srcDirs += ['local-res']
     defaultConfig.manifestPlaceholders = [appIcon: gameIcon ? '@mipmap/ic_game' : '@mipmap/ic_launcher',
+        appLabel: providers.gradleProperty('wwhdAppLabel').getOrElse('@string/app_name'),
         questTheaterEnabled: providers.gradleProperty('wwhdQuestTheater').getOrElse('true')]
     packaging {
         jniLibs {

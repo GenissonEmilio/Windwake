@@ -1,0 +1,228 @@
+# Manual, arm64-only fork build. Uploads a complete setup APK as an Actions
+# artifact; publishing and signing with the private release key happen locally.
+# The upstream release.yml and compiler-cache workflow remain independent.
+name: Windwake Android release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: "Windwake APK versionName (SemVer, without v)"
+        type: string
+        required: true
+        default: "0.3.0"
+      version_code:
+        description: "Android versionCode (increase for every distributed APK)"
+        type: number
+        required: true
+        default: 4
+      native_version:
+        description: "Native mod-catalogue version (keep the upstream v0.5.0 base)"
+        type: string
+        required: true
+        default: "v0.5.0-windwake.0.3.0"
+
+permissions:
+  contents: read
+
+jobs:
+  android-arm64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ABI: arm64-v8a
+      NDK_VERSION: 30.0.16248370
+      QUEST_THEATER: "OFF"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate explicit versions
+        env:
+          INPUT_VERSION: ${{ inputs.version_name }}
+          INPUT_CODE: ${{ inputs.version_code }}
+          INPUT_NATIVE: ${{ inputs.native_version }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          version, code, native = (os.environ[k] for k in ('INPUT_VERSION', 'INPUT_CODE', 'INPUT_NATIVE'))
+          semver = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?'
+          if len(version) > 80 or not re.fullmatch(semver, version):
+              raise SystemExit('version_name must be a SemVer without v')
+          if not re.fullmatch(r'[1-9][0-9]{0,9}', code) or int(code) > 2100000000:
+              raise SystemExit('version_code must be an integer from 1 to 2100000000')
+          if len(native) > 110 or not re.fullmatch(r'v0\.5\.0-windwake\.' + semver, native):
+              raise SystemExit('native_version must use v0.5.0-windwake.<SemVer> for catalogue compatibility')
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write(f'VERSION_NAME={version}\nVERSION_CODE={int(code)}\nNATIVE_VERSION={native}\n')
+              stream.write(f'APK=dist/Windwake-{version}-android-arm64.apk\n')
+          PY
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/wrapper-validation@v4
+
+      - name: Compiler reuse tests
+        run: python3 tools/android/test_reuse_release_compiler.py
+
+      - name: Install pinned NDK and Android SDK
+        timeout-minutes: 15
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Cache checksum-pinned upstream compiler carrier
+        uses: actions/cache@v5
+        with:
+          path: build/vendor/upstream-v0.5.0.apk
+          key: windwake-compiler-carrier-arm64-6af660aac1c67e5d99bbc653b1c2b9f0e429a8513e0e9ca0c497b0c37177f791
+
+      - name: Reuse only the reviewed LLVM compiler and licenses
+        run: |
+          python3 - <<'PY'
+          import hashlib, pathlib, sys, urllib.request
+          sys.path.insert(0, 'tools/android')
+          import reuse_release_compiler as compiler
+          compiler.verify_sources(pathlib.Path.cwd())
+          archive = pathlib.Path('build/vendor/upstream-v0.5.0.apk')
+          archive.parent.mkdir(parents=True, exist_ok=True)
+          def valid():
+              if not archive.is_file(): return False
+              with archive.open('rb') as stream:
+                  return hashlib.file_digest(stream, 'sha256').hexdigest() == compiler.APK_SHA256
+          if not valid():
+              partial = archive.with_suffix('.partial')
+              try:
+                  urllib.request.urlretrieve(compiler.RELEASE_URL, partial)
+                  with partial.open('rb') as stream:
+                      if hashlib.file_digest(stream, 'sha256').hexdigest() != compiler.APK_SHA256:
+                          raise SystemExit('official compiler carrier checksum mismatch')
+                  partial.replace(archive)
+              finally:
+                  partial.unlink(missing_ok=True)
+          PY
+          python3 tools/android/reuse_release_compiler.py --apk build/vendor/upstream-v0.5.0.apk \
+            --out build/compiler/apk-package > build/compiler-reuse.json
+
+      - name: Build fresh native runtime SDK and extractor
+        run: |
+          python3 tools/recomp/stubgen.py build/gen-stub
+          WWHD_VERSION="$NATIVE_VERSION" GEN_DIR="$PWD/build/gen-stub" ANDROID_SDK="$ANDROID_HOME" JOBS=4 android/build_native.sh
+          grep -qF "\"$NATIVE_VERSION\"" android/build/game/generated/build_info.cpp
+          cmake --build android/build/game --target wwhd-extract --parallel 4
+          NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
+          python3 tools/android/package_extractor.py --build android/build/game --ndk "$NDK" --abi "$ABI" --out build/extractor-apk
+          python3 tools/android/package_runtime.py --build android/build/game --ndk "$NDK" --abi "$ABI" --out build/runtime-sdk
+          rm "android/app/libs/$ABI/libmain.so"
+
+      - name: Cache pinned official CPython source build
+        uses: actions/cache@v5
+        with:
+          path: build/embedded-python/python.tar.gz
+          key: android-cpython-arm64-v8a-${{ hashFiles('tools/android/prepare_python.py') }}
+
+      - name: Package current Python setup sources with the fresh SDK
+        run: |
+          python3 tools/android/prepare_python.py --abi "$ABI" --ndk "$ANDROID_HOME/ndk/$NDK_VERSION" \
+            --out build/embedded-python --runtime-sdk build/runtime-sdk
+
+      - name: Build complete APK with a temporary CI signing key
+        run: |
+          keytool -genkeypair -noprompt -keystore "$RUNNER_TEMP/windwake-ci.p12" -storetype PKCS12 \
+            -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 \
+            -validity 2 -dname 'CN=Android Debug,O=Windwake CI,C=US'
+          keytool -exportcert -keystore "$RUNNER_TEMP/windwake-ci.p12" -storepass android \
+            -alias androiddebugkey -file "$RUNNER_TEMP/windwake-ci-cert.der"
+          export WWHD_KEYSTORE="$RUNNER_TEMP/windwake-ci.p12"
+          export WWHD_KEYSTORE_PASSWORD=android WWHD_KEY_PASSWORD=android WWHD_KEY_ALIAS=androiddebugkey
+          android/gradlew -p android --no-daemon -PwwhdAbi="$ABI" \
+            -PwwhdApplicationId=dev.windwake.android -PwwhdAppLabel=Windwake -PwwhdQuestTheater=false \
+            -PwwhdVersionName="$VERSION_NAME" -PwwhdVersionCode="$VERSION_CODE" \
+            -PwwhdPythonDir="$PWD/build/embedded-python/package" -PwwhdToolchainDir="$PWD/build/compiler/apk-package" \
+            -PwwhdExtractorDir="$PWD/build/extractor-apk" assembleRelease
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk "$APK"
+
+      - name: Guard, verify signature, assets and manifest; record provenance
+        run: |
+          python3 tools/release/guard.py "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" > build/apksigner.txt
+          cat build/apksigner.txt
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, shlex, subprocess, sys, zipfile
+          sys.path.insert(0, 'tools/android')
+          from reuse_release_compiler import inventory, METADATA
+          apk = pathlib.Path(os.environ['APK'])
+          def sha(path):
+              with path.open('rb') as stream: return hashlib.file_digest(stream, 'sha256').hexdigest()
+          certificate = sha(pathlib.Path(os.environ['RUNNER_TEMP']) / 'windwake-ci-cert.der')
+          signature = pathlib.Path('build/apksigner.txt').read_text()
+          signers = re.findall(r'^Signer #\d+ certificate SHA-256 digest: ([0-9a-f]+)$', signature, re.M)
+          if signers != [certificate]: raise SystemExit('APK must have exactly the temporary CI certificate')
+          aapt = pathlib.Path(os.environ['ANDROID_HOME']) / 'build-tools/35.0.0/aapt2'
+          badging = subprocess.check_output([str(aapt), 'dump', 'badging', str(apk)], text=True)
+          package = dict(token.split('=', 1) for token in shlex.split(badging.splitlines()[0])[1:] if '=' in token)
+          expected = {'name': 'dev.windwake.android', 'versionCode': os.environ['VERSION_CODE'], 'versionName': os.environ['VERSION_NAME']}
+          if any(package.get(k) != v for k, v in expected.items()): raise SystemExit('APK manifest identity/version mismatch')
+          if "application-label:'Windwake'" not in badging.splitlines(): raise SystemExit('APK label mismatch')
+          with zipfile.ZipFile(apk) as archive:
+              files = inventory(archive)
+              if any(re.fullmatch(r'lib/[^/]+/libmain\.so', n) for n in files): raise SystemExit('libmain.so is forbidden')
+              if any(n.startswith('lib/') and not n.startswith('lib/arm64-v8a/') for n in files): raise SystemExit('unexpected ABI in APK')
+              for name in files:
+                  if re.fullmatch(r'classes[0-9]*\.dex', name):
+                      data = archive.read(name)
+                      if b'SmokeActivity' in data or b'SyntheticSetupService' in data: raise SystemExit('debug fixture activity in APK')
+              required = {'toolchain-apk.json', 'toolchain-data.zip', 'runtime-sdk.json', 'python-home.zip',
+                          'extractor-apk.json', 'python-source.zip', 'python-build.json'}
+              if not {'assets/' + n for n in required} <= files: raise SystemExit('incomplete setup APK assets')
+              native = {'libSDL3.so', 'libc++_shared.so', 'libyaz0.so', 'libwwhdpython.so',
+                        'libwwhd-python-driver.so', 'libpython3.14.so', 'libcrypto_python.so',
+                        'libssl_python.so', 'libsqlite3_python.so'}
+              if not {'lib/arm64-v8a/' + n for n in native} <= files: raise SystemExit('incomplete native setup libraries')
+              # Every asset must match this run's packages, including the fresh runtime SDK.
+              for root in map(pathlib.Path, ['build/compiler/apk-package', 'build/embedded-python/package', 'build/extractor-apk']):
+                  for path in (root / 'assets').rglob('*'):
+                      if path.is_file() and archive.read(path.relative_to(root).as_posix()) != path.read_bytes():
+                          raise SystemExit('APK asset differs from current package: ' + path.name)
+              # prepare_python embeds the SDK under sdk/ in python-source.zip,
+              # rather than shipping a second, standalone runtime-sdk.zip.
+              import io
+              with zipfile.ZipFile(io.BytesIO(archive.read('assets/python-source.zip'))) as source, zipfile.ZipFile('build/runtime-sdk/assets/runtime-sdk.zip') as sdk:
+                  for name in sdk.namelist():
+                      if source.read(name) != sdk.read(name): raise SystemExit('fresh SDK missing from Python setup source')
+              compiler = json.loads(archive.read('assets/toolchain-apk.json'))
+              if compiler != METADATA: raise SystemExit('APK compiler metadata mismatch')
+              for name, expected_hash in compiler['sha256'].items():
+                  if hashlib.sha256(archive.read('lib/arm64-v8a/' + name)).hexdigest() != expected_hash:
+                      raise SystemExit('APK compiler driver changed: ' + name)
+              extractor = json.loads(archive.read('assets/extractor-apk.json'))
+              if hashlib.sha256(archive.read('lib/arm64-v8a/' + extractor['executable'])).hexdigest() != extractor['sha256']:
+                  raise SystemExit('APK extractor driver changed')
+              runtime = json.loads(archive.read('assets/runtime-sdk.json'))
+              python = json.loads(archive.read('assets/python-build.json'))
+          provenance = {'schema': 1, 'commit': os.environ['GITHUB_SHA'], 'repository': os.environ['GITHUB_REPOSITORY'],
+                        'run_url': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+                        'abi': os.environ['ABI'], 'ndk_revision': os.environ['NDK_VERSION'], 'native_version': os.environ['NATIVE_VERSION'],
+                        'application_id': package['name'], 'version_name': package['versionName'], 'version_code': int(package['versionCode']),
+                        'apk': apk.name, 'apk_sha256': sha(apk), 'signing': 'temporary-ci-key; resign locally before distribution',
+                        'certificate_sha256': certificate, 'compiler_reuse': json.loads(pathlib.Path('build/compiler-reuse.json').read_text()),
+                        'runtime_sdk': runtime, 'extractor': extractor, 'python': python}
+          pathlib.Path('dist/provenance.json').write_text(json.dumps(provenance, indent=2, sort_keys=True) + '\n')
+          PY
+          (cd dist && sha256sum *.apk provenance.json > SHA256SUMS.txt)
+
+      - name: Remove temporary signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/windwake-ci.p12" "$RUNNER_TEMP/windwake-ci-cert.der"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: Windwake-${{ env.VERSION_NAME }}-android-arm64-ci-signed
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0

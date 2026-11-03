@@ -50,6 +50,9 @@ env:
 
 jobs:
   version:
+    # Forks use their own release workflow; retain manual dry runs without
+    # triggering upstream's multi-platform publishing or nightly devel lookup.
+    if: github.repository == 'ZeldaWWHDRecomp/ZeldaWWHDRecomp' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -870,7 +873,7 @@ jobs:
   # The nightly run on the default branch (main) keeps the Android compiler cache there, the one release
   # tags can restore (a tag sees only its own and main's caches). Builds only when the key changed.
   android-compiler-cache:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' && github.repository == 'ZeldaWWHDRecomp/ZeldaWWHDRecomp'
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     strategy:
